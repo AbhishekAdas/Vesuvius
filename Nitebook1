@@ -1,0 +1,357 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import glob
+import PIL.Image as Image
+import torch.utils.data as data
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from tqdm import tqdm
+from ipywidgets import interact, fixed
+import os
+import warnings
+from sklearn.exceptions import UndefinedMetricWarning
+
+warnings.simplefilter('ignore', UndefinedMetricWarning)
+
+PREFIX = '/kaggle/input/vesuvius-challenge-ink-detection/train/1/'
+ROOT_PATH = '/kaggle/input/vesuvius-challenge-ink-detection/'
+SLICE_FOLDER = 'surface_volume'
+TRAIN_PATH = os.path.join(ROOT_PATH, 'train')
+TEST_PATH = os.path.join(ROOT_PATH, 'test')
+BUFFER = 30  # Buffer size in x and y direction
+Z_START = 27 # First slice in the z direction to use
+Z_DIM = 10   # Number of slices in the z direction
+TRAINING_STEPS = 30000
+LEARNING_RATE = 0.03
+BATCH_SIZE = 32
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+scroll_path = glob.glob(TRAIN_PATH+'/*')
+
+plt.imshow(Image.open(PREFIX+"ir.png"), cmap="gray")
+
+
+
+patch_size = BUFFER
+image_stack_path = scroll_path
+images = []
+
+ink_labels = []
+scroll_area_masks = []
+for path in image_stack_path:
+    down_sample_size = []
+    imgs = []
+    slice_path_list = sorted(glob.glob(os.path.join(path, SLICE_FOLDER)+'/*.tif'))
+    for i, slice_path in tqdm(enumerate(slice_path_list)):
+        if i==0:
+            image = np.array(Image.open(slice_path), dtype=np.float32)/65535.0
+            down_sample_size = (1024,920)
+            ink_labels.append(np.array(Image.open(os.path.join(path, 'inklabels.png')).resize(down_sample_size)))
+            scroll_area_masks.append(np.array(Image.open(os.path.join(path, 'mask.png')).resize(down_sample_size)))
+        image = np.array(Image.open(slice_path).resize((1024,920)), dtype=np.float32)/65535.0
+        imgs.append(image)
+    images.append(np.stack(imgs, axis=0))
+    
+    
+    
+
+class SubvolumeDataset(data.Dataset):
+    def __init__(self, images, scroll_area_masks, ink_labels, BUFFER):
+        self.images = images
+        self.scroll_area_masks = scroll_area_masks
+        self.ink_labels = ink_labels
+        self.patch_size = BUFFER
+        
+    def __len__(self):
+        return len(self.images)
+    def __getitem__(self, index):
+        image = self.images[index]
+        scroll_area_mask = self.scroll_area_masks[index]
+        ink_label = self.ink_labels[index]
+        pos_mask_index = np.argwhere(scroll_area_mask!=0)
+        loc = np.random.choice(np.arange(pos_mask_index.shape[0]))
+        x,y = pos_mask_index[loc]
+#         print(x,y)
+        start_y = max(y-self.patch_size//2,0)
+        
+#         print(scroll_area_mask.shape, ink_label.shape)
+        start_y, end_y = (start_y, start_y+(self.patch_size)) if self.patch_size+start_y<scroll_area_mask.shape[1] else ((scroll_area_mask.shape[1]) - self.patch_size ,scroll_area_mask.shape[1])             
+        start_x = max(x-self.patch_size//2,0)
+        start_x, end_x = (start_x, start_x+(self.patch_size)) if self.patch_size+start_x<scroll_area_mask.shape[0] else ((scroll_area_mask.shape[0]) - self.patch_size ,scroll_area_mask.shape[0]) 
+#         print(image.shape, start_x, end_x, start_y, end_y)
+        subvolume = image[:64,start_x:end_x, start_y:end_y]
+        label = ink_label[start_x:end_x, start_y:end_y]
+        return torch.from_numpy(subvolume).unsqueeze(0), torch.FloatTensor([label]) #subvolume, label
+        
+
+
+train_dataset = SubvolumeDataset(images, scroll_area_masks, ink_labels, 256)
+train_loader = data.DataLoader(train_dataset, batch_size=2, shuffle=True)
+
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class UNet(nn.Module):
+    def __init__(self, n_channels, n_classes, width_multiplier=1, trilinear=True, use_ds_conv=False):
+        """A simple 3D Unet, adapted from a 2D Unet from https://github.com/milesial/Pytorch-UNet/tree/master/unet
+        Arguments:
+          n_channels = number of input channels; 3 for RGB, 1 for grayscale input
+          n_classes = number of output channels/classes
+          width_multiplier = how much 'wider' your UNet should be compared with a standard UNet
+                  default is 1;, meaning 32 -> 64 -> 128 -> 256 -> 512 -> 256 -> 128 -> 64 -> 32
+                  higher values increase the number of kernels pay layer, by that factor
+          trilinear = use trilinear interpolation to upsample; if false, 3D convtranspose layers will be used instead
+          use_ds_conv = if True, we use depthwise-separable convolutional layers. in my experience, this is of little help. This
+                  appears to be because with 3D data, the vast vast majority of GPU RAM is the input data/labels, not the params, so little
+                  VRAM is saved by using ds_conv, and yet performance suffers."""
+        super(UNet, self).__init__()
+        _channels = (32, 64, 128, 256, 512)
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.channels = [int(c*width_multiplier) for c in _channels]
+        self.trilinear = trilinear
+        self.convtype = DepthwiseSeparableConv3d if use_ds_conv else nn.Conv3d
+
+        self.inc = DoubleConv(n_channels, self.channels[0], conv_type=self.convtype, mid_channels = self.channels[0])
+        self.down1 = Down(self.channels[0], self.channels[1], conv_type=self.convtype)
+        self.down2 = Down(self.channels[1], self.channels[2], conv_type=self.convtype)
+        self.down3 = Down(self.channels[2], self.channels[3], conv_type=self.convtype)
+        factor = 2 if trilinear else 1
+        self.down4 = Down(self.channels[3], self.channels[4] // factor, conv_type=self.convtype)
+        self.up1 = Up(self.channels[4], self.channels[3] // factor, trilinear)
+        self.up2 = Up(self.channels[3], self.channels[2] // factor, trilinear)
+        self.up3 = Up(self.channels[2], self.channels[1] // factor, trilinear)
+        self.up4 = Up(self.channels[1], self.channels[0], trilinear)
+        self.outc = OutConv(self.channels[0], n_classes)
+
+    def forward(self, x):
+        print(x.shape)
+        x1 = self.inc(x)
+        print(x1.shape,'||||||||||||||||||||')
+        x2 = self.down1(x1)
+        print(x2.shape,'x2 shape')
+        x3 = self.down2(x2)
+        print(x3.shape,'x3 shape')
+#         print(x3.shape)
+        x4 = self.down3(x3)
+        print(x4.shape,'x4 shape')
+        x5 = self.down4(x4)
+        print(x5.shape,'x5 shape')
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        print(x.shape, x1.shape)
+        x = self.up4(x, x1)
+        logits = self.outc(x)
+        print(logits.shape,'logits shape')
+        return logits
+
+
+class DoubleConv(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
+
+    def __init__(self, in_channels, out_channels, conv_type=nn.Conv3d, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            conv_type(in_channels, mid_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(mid_channels),
+            nn.ReLU(inplace=True),
+            conv_type(mid_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
+
+    def __init__(self, in_channels, out_channels, conv_type=nn.Conv3d):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool3d(2),
+            DoubleConv(in_channels, out_channels, conv_type=conv_type)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+
+class Up(nn.Module):
+    """Upscaling then double conv"""
+
+    def __init__(self, in_channels, out_channels, trilinear=True):
+        super().__init__()
+
+        # if trilinear, use the normal convolutions to reduce the number of channels
+        if trilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, mid_channels=in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose3d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # input is CHW
+#         diffY = x2.size()[2] - x1.size()[2]
+#         diffX = x2.size()[3] - x1.size()[3]
+
+#         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+#                         diffY // 2, diffY - diffY // 2])
+        # if you have padding issues, see
+        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
+        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+        print(x1.shape,'-------------', x2.shape)
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class DepthwiseSeparableConv3d(nn.Module):
+    def __init__(self, nin, nout, kernel_size, padding, kernels_per_layer=1):
+        super(DepthwiseSeparableConv3d, self).__init__()
+        self.depthwise = nn.Conv3d(nin, nin * kernels_per_layer, kernel_size=kernel_size, padding=padding, groups=nin)
+        self.pointwise = nn.Conv3d(nin * kernels_per_layer, nout, kernel_size=1)
+
+    def forward(self, x):
+        out = self.depthwise(x)
+        out = self.pointwise(out)
+        return 
+        
+        
+
+model = UNet(1,1).to(DEVICE)
+
+TRAINING_STEPS = 60000
+LEARNING_RATE = 1e-3
+TRAIN_RUN = True # To avoid re-running when saving the notebook
+
+
+if TRAIN_RUN:
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, total_steps=TRAINING_STEPS)
+    model.train()
+    running_loss = 0.0
+    running_accuracy = 0.0
+    running_fbeta = 0.0
+    denom = 0
+    pbar = tqdm(enumerate(train_loader), total=TRAINING_STEPS)
+    for i, (subvolumes, inklabels) in pbar:
+        print(subvolumes.shape)
+        if i >= TRAINING_STEPS:
+            break
+        optimizer.zero_grad()
+        outputs = model(subvolumes.to(DEVICE))
+        print(outputs.shape, inklabels.shape)
+        loss = criterion(outputs, inklabels.to(DEVICE))
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        pred_ink = outputs.detach().sigmoid().gt(0.4).cpu().int()
+        accuracy = (pred_ink == inklabels).sum().float().div(inklabels.size(0))
+        running_fbeta += fbeta_score(inklabels.view(-1).numpy(), pred_ink.view(-1).numpy(), beta=0.5)
+        running_accuracy += accuracy.item()
+        running_loss += loss.item()
+        denom += 1
+        pbar.set_postfix({"Loss": running_loss / denom, "Accuracy": running_accuracy / denom, "Fbeta@0.5": running_fbeta / denom})
+        if (i + 1) % 500 == 0:
+            running_loss = 0.
+            running_accuracy = 0.
+            running_fbeta = 0.
+            denom = 0
+
+    torch.save(model.state_dict(), "/kaggle/working/model.pt")
+
+else:
+    model_weights = torch.load("/kaggle/working/model.pt")
+    model.load_state_dict(model_weights)
+    
+
+
+# Clear memory before loading test fragments
+train_dset.labels = None
+train_dset.image_stacks = []
+del train_loader, train_dset
+gc.collect()
+
+
+test_path = base_path / "test"
+test_fragments = [test_path / fragment_name for fragment_name in test_path.iterdir()]
+print("All fragments:", test_fragments)
+
+
+pred_images = []
+model.eval()
+for test_fragment in test_fragments:
+    outputs = []
+    eval_dset = SubvolumeDataset(fragments=[test_fragment], voxel_shape=(48, 64, 64), load_inklabels=False)
+    eval_loader = thd.DataLoader(eval_dset, batch_size=BATCH_SIZE, shuffle=False)
+    with torch.no_grad():
+        for i, (subvolumes, _) in enumerate(tqdm(eval_loader)):
+            output = model(subvolumes.to(DEVICE)).view(-1).sigmoid().cpu().numpy()
+            outputs.append(output)
+    # we only load 1 fragment at a time
+    image_shape = eval_dset.image_stacks[0].shape[1:]
+    eval_dset.labels = None
+    eval_dset.image_stacks = None
+    del eval_loader
+    gc.collect()
+
+    pred_image = np.zeros(image_shape, dtype=np.uint8)
+    outputs = np.concatenate(outputs)
+    for (y, x, _), prob in zip(eval_dset.pixels[:outputs.shape[0]], outputs):
+        pred_image[y ,x] = prob > 0.4
+    pred_images.append(pred_image)
+    
+    eval_dset.pixels = None
+    del eval_dset
+    gc.collect()
+    print("Finished", test_fragment)pred_images = []
+model.eval()
+for test_fragment in test_fragments:
+    outputs = []
+    eval_dset = SubvolumeDataset(fragments=[test_fragment], voxel_shape=(48, 64, 64), load_inklabels=False)
+    eval_loader = thd.DataLoader(eval_dset, batch_size=BATCH_SIZE, shuffle=False)
+    with torch.no_grad():
+        for i, (subvolumes, _) in enumerate(tqdm(eval_loader)):
+            output = model(subvolumes.to(DEVICE)).view(-1).sigmoid().cpu().numpy()
+            outputs.append(output)
+    # we only load 1 fragment at a time
+    image_shape = eval_dset.image_stacks[0].shape[1:]
+    eval_dset.labels = None
+    eval_dset.image_stacks = None
+    del eval_loader
+    gc.collect()
+
+    pred_image = np.zeros(image_shape, dtype=np.uint8)
+    outputs = np.concatenate(outputs)
+    for (y, x, _), prob in zip(eval_dset.pixels[:outputs.shape[0]], outputs):
+        pred_image[y ,x] = prob > 0.4
+    pred_images.append(pred_image)
+    
+    eval_dset.pixels = None
+    del eval_dset
+    gc.collect()
+    print("Finished", test_fragment)
